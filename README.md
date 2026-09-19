@@ -1,1 +1,1 @@
-# statistical-modelling-for-epidemiology
+# Statistical Modelling for Epidemiology
