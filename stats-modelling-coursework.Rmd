@@ -1,0 +1,756 @@
+---
+title: "Analysis of Respiratory Clinic Data"
+author: "Oles Matiushenko"
+date: "2026-06-28"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE, message=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(here)
+library(dagitty)
+library(ggdag)
+library(survival)
+library(gtsummary)
+
+
+source(here("scripts/utils/edinburgh_style.R"))
+set_edinburgh_theme()
+
+OUTPUT_DIR <- "outputs"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+```
+
+## Introduction
+
+In this report, I explore and analyse data from a respiratory clinic. Two groups of subjects received different types of treatment - the new therapy and the standard care. The report aims to study the effects of the new treatment on clinical outcomes and to establish whether there is a quantifiable difference between the treatment regimens. 
+
+The paper takes the reader from initial data exploration and all the way to survival analysis. I hope you will enjoy reviewing it as much as I enjoyed doing the analysis!
+
+## Part I
+
+```{r load-data}
+
+raw_data <- 
+  read_csv(here("data/respiratory_synthetic_assignment.csv"))
+
+# raw_data %>% head(10)
+# raw_data %>% str()
+# raw_data %>% glimpse()
+
+```
+
+The dataset contains 620 observations and 17 variables. The character variables that might be of interest, including *sex*, *smoking_status*, *deprivation_quintile*, and *new_therapy*, would be more convenient to use (and efficient to store) as factors. 
+
+The binary variables *severe_exacerbation_12m* and *followup_event* could work either as categorical or logical (boolean) data type. However, I may need to perform numerical operations on these, so leaving them as numeric. The common convention for binary data is to code the presence of an outcome event as 1 and the absence of such as 0. Both binary variables conform to the convention. 
+
+```{r data-transformation}
+
+resp_data <- raw_data %>%
+  mutate(
+    across(where(is.character), as.factor),
+    treatment_group = new_therapy
+  ) %>% 
+  select(-new_therapy)
+
+```
+
+A quick inspection with the *summary()* function shows no issues with missing data. 
+
+We can also see considerable variability in age (median = 58, range = 19 to 88) and baseline clinical characteristics of the participants, particularly symptom score (median = 24.9, range = 4.3 to 40.0) and FEV1 (median = 63.1, range = 25.0 to 102.6) Some individuals had substantially more comorbidities (median = 1, range = 0 to 5) or experienced exacerbations prior to the study much more frequently than others (median = 1, range = 0 to 7). 
+
+```{r summary}
+
+# resp_data %>% summary()
+
+```
+
+```{r age-hist}
+
+hist_age <- 
+  ggplot(data = resp_data, aes(x = age)) +
+  geom_histogram_edinburgh(bins = 30) +
+  labs(
+    title = "Subjects by Age",
+    subtitle = "An approximately normal distribution with a slightly heavier left tail"
+  )
+
+apply_edinburgh_labels(hist_age)
+  
+```
+
+```{r baseline-characteristics-by-group}
+
+baseline_stats <- resp_data %>%
+  group_by(treatment_group) %>%
+  summarise(
+    mean_age = mean(age),
+    sd_age = sd(age),
+    mean_symptom_score = mean(baseline_symptom_score),
+    sd_symptom_score = sd(baseline_symptom_score),
+    mean_prior_exacerbations = mean(prior_exacerbations_12m),
+    sd_prior_exacerbations = sd(prior_exacerbations_12m),
+    mean_comorbidities = mean(comorbidity_count),
+    sd_comorbidities = sd(comorbidity_count),
+    `Mean FEV1 (%)` = mean(baseline_fev1_pct),
+    `SD FEV1 (%)` = sd(baseline_fev1_pct)
+  )
+
+t_baseline1 <- table_edinburgh(
+  baseline_stats %>% 
+    select(-contains(c("comorb", "exacerb"))),
+  title = "Age and Baseline Clinical Characteristics by Treatment Group"
+)
+
+t_baseline1
+
+```
+
+Age, mean symptom score, and Forced Expiratory Volume in 1 second (FEV1) look comparable between groups.
+
+In contrast, the mean comorbidity count and mean exacerbation count within 12 months prior to the study were substantially higher in the new therapy group. 
+
+```{r comorbidities-and-exacerbations}
+
+t_baseline2 <- table_edinburgh(
+  baseline_stats %>% 
+    select(
+      contains(c("treatment", "comorb", "exacerb"))
+      ),
+  title = 
+    "Comorbidities and Prior Exacerbations by Treatment Group"
+)
+
+t_baseline2
+
+```
+
+Welch's two-sample t-test was performed to formally assess the differences. The test produced a statistically significant test statistics of 3.44 (df = 472, p \< 0.001) and 4.17 (df = 482, p \< 0.001) for comorbidity count and prior exacerbations count, respectively, rejecting the null hypothesis of no difference between the group means. These differences are important to adjust for in further modelling, since more favorable health conditions at baseline could be linked to superior treatment outcomes.
+
+```{r ttest}
+
+# t.test(comorbidity_count ~ treatment_group, data = resp_data)
+# 
+# t.test(prior_exacerbations_12m ~ treatment_group,
+#        data = resp_data)
+
+```
+
+The new therapy group had a somewhat larger percentage of females than males (56% vs. 44%), while the standard care group had a roughly even gender distribution (49% females vs. 51% males). The new therapy group also had a higher percentage of current smokers (24% vs. 19%). 
+
+```{r sex}
+
+table_labels <- 
+  list(
+    treatment_group = "Treatment Group",
+    sex = "Sex",
+    age = "Age",
+    smoking_status = "Smoking Status",
+    deprivation_quintile = "Deprivation Quintile"
+    )
+
+resp_data %>% 
+  tbl_cross(
+    row = treatment_group,
+    col = sex,
+    percent = "row",
+    label = table_labels
+  ) %>% 
+  bold_labels()
+
+```
+
+```{r smoking-status}
+
+resp_data %>% 
+  tbl_cross(
+    row = treatment_group,
+    col = smoking_status,
+    percent = "row",
+    label = table_labels
+  ) %>% 
+  bold_labels()
+
+```
+
+The groups were comparable in terms of socio-economic status, with similar distribution of the subjects across deprivation quintiles.
+
+```{r deprivation-quintiles}
+
+resp_data %>% 
+  tbl_cross(
+    row = treatment_group,
+    col = deprivation_quintile,
+    percent = "row",
+    label = table_labels
+  ) %>% 
+  bold_labels()
+
+```
+
+Overall, there is quite a bit of variability across the sample. It also seems that the allocation to the treatment groups was not random. This is evidenced by significantly different mean comorbidity and prior exacerbations counts. These factors are important to account for in later modelling.
+
+## Part II
+
+Improvement in symptoms at 6 months is encoded by *symptom_change_6m*. The variable shows the change in the symptom score relative to baseline, with positive values corresponding to improvement. 
+
+```{r boxplot-6m-change}
+
+theme_settings <-
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 16),
+    axis.title.x = element_text(size = 14, 
+                                margin = margin(t = 8)),
+    axis.title.y = element_text(size = 14, 
+                                margin = margin(r = 8)),
+    plot.margin = margin(
+      t = 20,
+      b = 20,
+      l = 20,
+      r = 20
+    )
+  )
+
+bp <- resp_data %>% 
+  ggplot(aes(x = treatment_group, 
+             y = symptom_change_6m, 
+             fill = treatment_group)) +
+  geom_boxplot() +
+  scale_fill_edinburgh() +
+  labs(
+    title = "Change in symptoms after 6 months of treatment", 
+    subtitle = "Positive values indicate improvement",
+    x = "Treatment group", 
+    y = "Symptoms change (points)"
+    ) +
+  theme_settings
+
+bp
+
+```
+
+On average, subjects receiving new treatment demostrated some clinical improvement at 6-month follow-up, while subjects receiving usual therapy experienced deterioration in symptoms. However, it is also evident that there is substantial overlap in clinical outcomes, with some individuals in the usual therapy group achieving greater improvement than most subjects in the new treatment group. This indicates that the treatment allocation alone cannot fully explain the differences in clinical outcomes and that other factors are likely involved.
+
+```{r table-6m-change}
+
+t_6m_change <- resp_data %>% 
+  group_by(treatment_group) %>% 
+  summarise(
+    subjects = n(),
+    mean_symptom_change = mean(symptom_change_6m),
+    sd_symptom_change = sd(symptom_change_6m)
+  ) 
+
+table_edinburgh(
+  t_6m_change,
+  title = "Change in Symptom Scores after 6 Months"
+)
+
+```
+
+### DAG
+
+Below is a simplified causal diagram illustrating putative sources of confounding.
+
+```{r dag}
+
+dag <- dagitty(
+  "
+  dag {
+  
+  Treatment [exposure, pos=\"0,1\"]
+  Improvement [outcome, pos=\"4,1\"]
+  
+  Unobserved [latent, pos=\"2, 2.65\"]
+  
+  Age [pos=\"1,1.75\"]
+  Sex [pos=\"2,1.75\"]
+  Smoking [pos=\"3,1.75\"]
+  FEV1 [pos=\"0.5, -0.5\"]
+  ClinicalScore [pos=\"1.5,-0.5\"]
+  Exacerbations [ pos=\"2.5,-0.5\"]
+  Comorbidities [pos=\"3.5,-0.5\"]
+  
+  Treatment -> Improvement
+  
+  Treatment <- Unobserved -> Improvement
+  
+  Treatment <- Age -> Improvement
+  Treatment <- Sex -> Improvement
+  Treatment <- Smoking -> Improvement
+  Treatment <- FEV1 -> Improvement
+  Treatment <- ClinicalScore -> Improvement
+  Treatment <- Exacerbations -> Improvement
+  Treatment <- Comorbidities -> Improvement
+
+}
+")
+
+ggdag_status(
+  dag,
+  use_labels = NULL,
+  text = TRUE,
+  node = TRUE,
+  node_size = 24,
+  text_size = 2.5
+) +
+  
+  labs(title =
+  "A simplified DAG showing observed (grey) and unobserved (green)\nconfounders influencing both the exposure (Treatment)\nand the outcome (Improvement)") +
+  
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      margin = margin(t = 10, b = 10),
+      hjust = 0.5,
+      size = 14,
+      face = "bold",
+      color = EDINBURGH_DARK
+    ),
+    plot.margin = margin(
+      t = 10,
+      b = 20,
+      l = 10,
+      r = 10
+    )
+  )
+
+```
+
+It was previously discovered that the average counts of comorbidities and prior exacerbations per subject significantly differred between two groups. 
+This suggests the absence of randomization and concedes the assumption that 
+subjects with the higher disease burden were more likely to receive 
+the new treatment. Although there was no clear evidence of difference by other baseline characteristics, it is still reasonable to assume that the allocation procedure might have been biased and factors such as age, sex, smoking status, FEV1, and baseline clinical score might have influenced the allocation decision as well. 
+Any of these factors could have an impact on the outcome as independent variables. 
+Since it is impossible to rule out the possibility of biased allocation, I am opting to include them in the model as confounders.
+
+### Linear regression
+
+The change in symptoms after 6 months is represented as a continuous numeric variable, with both positive and negative values possible. A normal linear regression model is suitable for this kind of outcome. The alternatives, such as the logistic and Poisson regression, are sub-optimal in this case, since the former models the log-odds of the binary outcome and the latter is appropriate for count data. 
+
+```{r univariate-lm}
+
+bp
+
+lm_naive <- lm(symptom_change_6m ~ treatment_group, data = resp_data)
+# summary(lm_naive)
+model_summary_edinburgh(lm_naive, title = "Naive Linear Regression Coefficients")
+
+```
+
+The naive model suggests a statistically significant association between treatment and clinical outcomes at 6 months. The coefficient for allocation to the usual care group is -1.76 (95% CI: -2.49 to -1.04, p \< 0.001). This can be interpreted as subjects in the new therapy group achieving, on average, a 1.76 points greater improvement than subjects in the usual care group.
+
+However, the multiple R-squared value is only 0.035, meaning that only about 3.5% of the variability in the outcomes can be explained by the treatment assignment alone.
+
+Let's add putative confounders to the equation.
+
+```{r multivariate-lm}
+
+lm_adjusted <- lm(
+  symptom_change_6m ~ 
+    treatment_group + 
+    prior_exacerbations_12m +
+    comorbidity_count + 
+    sex + age + smoking_status +
+    baseline_fev1_pct + 
+    baseline_symptom_score, 
+  data = resp_data)
+
+# summary(lm_adjusted)
+
+model_summary_edinburgh(lm_adjusted, title = "Adjusted Linear Regression Coefficients")
+
+```
+
+None of the coefficients, except for the treatment group, are be significant when holding all other variables constant. It is somewhat expected, given that adding more confounders to the model dillutes the statistical power and that the sample size is not extremely large. However, it is rather unexpected that the multiple R-squared value remains very low, at only 0.058. 
+
+Let's check if the assumptions underlying linear regression are reasonable.
+
+### Model diagnostics
+
+```{r lm-residuals}
+
+residuals <- lm_adjusted$residuals
+fitted    <- lm_adjusted$fitted.values
+
+p_lm_residuals <- ggplot(
+  data = tibble(
+    residuals = lm_adjusted$residuals, 
+    fitted    = lm_adjusted$fitted.values
+    ),
+  aes(x = fitted, y = residuals)
+  ) +
+  geom_point_edinburgh() + 
+  geom_hline(
+    yintercept = 0, 
+    linetype = "dashed", 
+    colour = EDINBURGH_ACCENT
+    ) +
+  labs(title = "Residuals vs Fitted Values") +
+  theme_settings
+
+apply_edinburgh_labels(p_lm_residuals)
+
+```
+
+The residuals represent a random blob around fitted values with no clear pattern. This is expected for normal linear regression models.
+
+```{r lm-qq}
+
+qq_plot <- qq_plot_edinburgh(residuals)
+qq_plot <- apply_edinburgh_labels(qq_plot)
+qq_plot + theme_settings
+
+```
+
+The Q-Q plot shows a reasonably normal distribution of the residuals with only minor deviations at both tales - a common and acceptable pattern. The assumption of normality of the residuals holds. 
+
+### Summary
+
+Allocation to the new treatment seems to be associated with greater improvement in symptoms score after 6 months compared to usual treatment. Both naive and adjusted model produced highly significant coefficients for the treatment group. However, almost 95% of the variability in the outcomes remain unexplained, which suggests either the presence of influential unobserved confounders, a non-linear (e.g., dose-related) relationship between the exposure and outcome, or both.  
+
+## Part III
+
+The count of GP-treated exacerbations, experienced by individuals during the first 12 months of follow-up, is stored in the *gp_exacerbations_12m* variable. 
+
+```{r exacerbations}
+
+hist_gp_exacerbations <- 
+  resp_data %>% 
+  ggplot(aes(x = gp_exacerbations_12m)) +
+  geom_histogram_edinburgh() +
+  scale_x_continuous(
+    breaks = seq(
+      0, 
+      max(resp_data$gp_exacerbations_12m),
+      by = 1
+    )
+  ) +
+  labs(
+    title = "Count of GP Exacerbations in 12 months",,
+    subtitle = "A typical heavy right tail observed",
+    x = "GP Exacerbations in 12 Months",
+    y = "Subjects"
+    ) +
+  theme_settings +
+  theme(legend.position = "none")
+
+hist_gp_exacerbations
+
+```
+
+The histogram shows a heavy right tail that is typical of Poisson distribution. 
+
+The mean count of GP-treated exacerbations was somewhat higher in the new therapy group. This, however, does not automatically indicate that the experimental treatment is associated with more adverse effects. It is likely that the difference might be  attributable either to chance or confounding. For instance, it was previously discovered that the subjects in the new therapy group had experienced, on average, exacerbations more frequently in the past, meaning that this group was more prone to exacerbations, in general. 
+
+```{r table-gp-exacerbations}
+
+t_gp_exacerbations <-
+  resp_data %>%
+  group_by(treatment_group) %>%
+  summarise(
+    subjects = n(),
+    `Mean GP Exacerbations` = mean(gp_exacerbations_12m),
+    `SD GP Exacerbations` = sd(gp_exacerbations_12m)
+  )
+
+table_edinburgh(
+  t_gp_exacerbations,
+  "Mean Count of GP-treated Exacerbations in 12 Months"
+  )
+
+```
+
+### Poisson regression
+
+I will be using Poisson regression to model the relationship between treatment and GP-treated exacerbations. Poisson regression is often the option choice for count outcomes. Normal linear regression could sometimes be used for discrete outcomes in large samples, but it would be inadequate in this case, since counts are strictly non-negative.
+
+```{r univariate-poisson}
+
+poisson_naive <- glm(gp_exacerbations_12m ~ treatment_group,
+  family = poisson,
+  data = resp_data)
+
+model_summary_edinburgh(poisson_naive, scale = "both")
+
+```
+
+The model outputs a raw coefficient of -0.108 for the usual care group. This value represents the log of the mean of the count of GP-treated events, experienced by subjects receiving standard treatment. To make this more interpretable, this value is exponentiated to derive the rate ratio of 0.898, which corresponds to a 10.2% lower frequency of GP-treated events in the usual care group. This finding aligns with descriptive statistics.
+
+However, there are a two important nuances here: 
+1. The p-value for the coefficient is above the threshold level of 0.05, which does not provide strong enough evidence for rejecting the null hypothesis of no association.
+2. The lower and upper bounds of the 95% confidence interval are on the opposite sides of 1.0, which means we cannot establish the direction of the effect.
+
+Let's adjust the model for potential confounders. 
+
+It is plausible that all of the factors, included in the normal multivariate linear model, may also be relevant here. The respiratory disease under investigation could be genetically linked to gender. Health, generally, deteriorates with age. Active smoking is highly likely to trigger a relapse of a respiratory disease. Poor medical condition at baseline might mean that the person was closer to exacerbation when the study started compared to someone healthier. Since we cannot be sure that allocation was unbiased (i.e., random and concealed), we also cannot exclude the possibility of subjects being assigned to treatment based on specific characteristic (e.g., older subjects with a history of complications being more likely to receive experimental treatment). Therefore, I include all of the aforementioned factors as confounders.
+
+```{r multivariate-poisson}
+
+poisson_adjusted <-
+  glm(
+    gp_exacerbations_12m ~
+      treatment_group + age + sex + 
+      prior_exacerbations_12m + comorbidity_count + 
+      baseline_symptom_score + baseline_fev1_pct + 
+      smoking_status,
+    family = poisson,
+    data = resp_data
+  )
+
+# summary(poisson_adjusted)
+
+model_summary_edinburgh(
+  poisson_adjusted, 
+  scale = "both",
+  title = "Poisson Regression Coefficients"
+  )
+
+```
+
+Holding other variables constant, the model estimates higher counts of comorbidities and prior exacerbations to be associated with increased rates of GP-treated events during the first year of follow-up. The rate ratios (including the lower bound of the confidence interval) for both factors exceed 1.0 and are highly statistically significant (p \< 0.001). In contrast, subjects who had quit smoking or never smoked were less likely to develop exacerbations compared to active smokers (rate ratios < 1.0, p \< 0.001). 
+
+Interestingly, with the introduction of extra variables to the model, the estimate for the rate ratios in the usual care group has changed from 0.898 (reduced risk) to 1.120 (increased risk). However, the p-value for the coefficient was still above the 0.05 threshold.
+
+### Model diagnostics
+
+Next, we diagnose the model's validity and fit by analysing standardized Pearson's residuals and residual deviance. 
+
+#### Pearson's residuals
+
+```{r pearson_residuals}
+
+pearson_residuals <- residuals(poisson_adjusted, type = "pearson")
+fitted            <- fitted(poisson_adjusted)
+
+p_poisson_residuals <- 
+  ggplot(data = tibble(
+    residuals = pearson_residuals,
+    fitted    = fitted
+    ),
+    aes(x = fitted, y = pearson_residuals)
+  ) +
+  geom_point_edinburgh() + 
+  geom_hline(
+    yintercept = 0, 
+    linetype = "dashed", 
+    colour = EDINBURGH_ACCENT
+    ) +
+  scale_x_continuous(
+    breaks = seq(
+      0, 
+      max(fitted),
+      by = 1
+    )
+  ) +
+  labs(title = "Pearson Residuals vs Fitted Values") +
+  theme_settings
+
+apply_edinburgh_labels(p_poisson_residuals)
+
+```
+
+Unlike residuals in normal linear regression, Pearson's residuals are not expected to form a random mass around fitted values for the model to be valid. Stripe-like patterns on residual plots are typical for Poisson regression.  
+
+#### Deviance
+
+```{r deviance}
+
+t_deviance <- tibble(
+  Metric = c(
+    " Residual Deviance (D)",
+    " Residual Degrees of Freedom ",
+    " Dispersion (D / df)"
+  ),
+  Value = c(
+    poisson_adjusted$deviance ,
+    poisson_adjusted$df.residual ,
+    poisson_adjusted$deviance / poisson_adjusted$df.residual
+  )
+)
+
+t_deviance <- t_deviance %>%
+  mutate(Value = signif (Value , 3))
+
+t_deviance <- 
+  table_edinburgh(
+    t_deviance, 
+    title = "Deviance Diagnostics"
+    )
+
+t_deviance
+
+```
+
+The residual deviance (699) is slightly larger than residual  degrees of freedom (610). The resulting dispersion statistic of 1.15 indicates adequate fit (the value is reasonably close to 1). Mild overdispersion suggests that more advanced models, such as the negative binomial or quasi-Poisson regression, may be more appropriate for capturing the variability of the sample data.
+
+### Summary
+
+There is not enough evidence to reject the null hypothesis of no association between treatment and the count of GP-treated events. Poisson regression model suits the data reasonably well, although higher accuracy could likely be achieved with more advanced modelling.
+
+## Part IV
+
+All 249 subjects in the new therapy group were followed-up until an event. There was some censoring (21 cases, 5.6%) in the usual care group, which means that some of the data was partially lost. The median time to event was comparable between the groups.
+
+```{r survival-summary}
+
+t_survival <- resp_data %>%
+  group_by(treatment_group) %>%
+  summarise(
+    subjects = n(),
+    events   = sum(followup_event),
+    censored = sum(followup_event == 0),
+    `Median Time to Event (days)` = median(time_to_event_days)
+  )
+
+t_survival <- table_edinburgh(
+  t_survival,
+  title = "Survival Data"
+)
+
+t_survival
+
+```
+
+### Kaplan-Meier survival plot
+
+```{r kaplan-meier, eval=FALSE}
+
+kaplan_meier <- survfit(
+  Surv(time_to_event_days, followup_event) ~ treatment_group, 
+  data = resp_data
+  )
+
+p_kaplan_meier <- km_plot_edinburgh(
+  kaplan_meier,
+  title = "Kaplan-Meier survival curves by treatment group",
+  strata_title = "Treatment group",
+  risk_table_title = "Number at risk by group"
+  )
+
+p_kaplan_meier
+
+```
+
+The survival curves are almost inseparable across the entire duration of the follow-up, crossing at multiple timepoints. By looking at the plot only, it does not seem like there is a difference in the median time to event across groups. However, the Kaplan-Meier estimator does not provide a quantitative comparison of the difference in survival times and, importantly, does not allow adjusting for potential confounding.
+
+### Parametric models
+
+I, therefore, fit two parametric models: exponential and Weibull. The models output a raw estimate as a log of survival time ratio, which then has to be exponentiated to obtain an interpretable value. A time ratio of greater than 1 means that a covariate is associated with increased survival times. 
+
+```{r exponential}
+
+exponential <- survreg(
+  Surv(time_to_event_days, followup_event) ~
+    treatment_group + age + sex + 
+    prior_exacerbations_12m + comorbidity_count + 
+    baseline_symptom_score + baseline_fev1_pct + 
+    smoking_status,
+  data = resp_data,
+  dist = "exponential"
+)
+
+model_summary_edinburgh(
+  exponential, 
+  title = "Exponential Regression Coefficients"
+  )
+
+```
+
+```{r weibull}
+
+weibull <- survreg(
+  Surv(time_to_event_days, followup_event) ~
+    treatment_group + 
+    prior_exacerbations_12m + comorbidity_count + 
+    baseline_symptom_score + baseline_fev1_pct + 
+    smoking_status, 
+  data = resp_data,
+  dist = "weibull"
+)
+
+model_summary_edinburgh(
+  weibull, 
+  scale = "both",
+  title = "Weibull Regression Coefficients"
+  )
+
+```
+
+Neither of the models identified a significant association between the exposure (or any of the confounders) and outcome. One of the possible explanations is that there is, indeed, no association. It is also possible that the models are not appropriate for the data. 
+
+Of the two parametric models, Weibull achieved a lower AIC value, which indicates better fit relative to the model's complexity 
+
+```{r aic}
+
+t_model_comp <- tibble(
+  Model = c("Exponential", "Weibull"),
+  LogLik = c(exponential$loglik[2], weibull$loglik[2]),
+  AIC  = c(AIC(exponential), AIC(weibull))
+)
+
+t_model_comp <- table_edinburgh(
+  t_model_comp,
+  title = "Comparison of exponential and Weibull models"
+) 
+
+t_model_comp
+
+```
+
+### Cox regression
+
+We now turn to the third type of survival models - a semi-parametric Cox proportional hazard model. The Cox model does not assume that the hazards remain unchanged during the entire follow-up (like the exponential model does), but rather that the hazard ratios between compared groups are constant. The model provides raw estimates for covariates in the form of the logs of the hazard ratios.
+
+```{r cox}
+
+cox <- coxph(
+  Surv(time_to_event_days, followup_event) ~
+    treatment_group + 
+    prior_exacerbations_12m + comorbidity_count + 
+    baseline_symptom_score + baseline_fev1_pct + 
+    smoking_status, 
+  data = resp_data
+)
+
+model_summary_edinburgh(
+  cox, 
+  title = "Cox proportional hazards model estimates"
+  )
+
+hazard_ratio <- exp(cox$coefficients[1])
+conf_int_025 <- round(exp(confint(cox)[1]), 3) 
+conf_int_975 <- round(exp(confint(cox)[2]), 3)
+
+```
+
+Unlike the parametric models, the Cox proportional hazards model identified a statistically significant association for the treatment group. Receiving usual care was associated with approximately 15% lower hazard of hospital admission or death compared with the new therapy (hazard ratio = `r hazard_ratio`, 95% CI: `r conf_int_025` to `r conf_int_975`, p \< 0.05), holding all other variables constant. 
+
+```{r cox-test, eval=FALSE}
+
+ph_test <- cox.zph(cox)
+plot(ph_test)
+
+```
+
+The graph shows that the hazard ratio seems to remain constant over time. The model fits reasonably well.
+
+### Summary 
+
+Overall, the evidence on the association between treatment and time to hospital admission is inconclusive. The Kaplan-Meier survival curves for the two groups look indistinguishable. The parametric models provide no evidence of association. The Cox proportional hazards model outputs a marginally significant coefficient.  
+
+
+## Conclusion
+
+On the whole, the analysis produced mixed results. Allocation to the new treatment was associated with greater improvement in symptoms score after 6 months compared to usual treatment, but seemed to have no meaningful effect on GP-treated events. Cox proportional hazards model showed that the new therapy might be associated with greater hazards of death or hospital admission, although this is far from conclusive, since the parametric models showed no evidence of such association.
+
+As things stand, there is not enough evidence to support the promotion of the new therapy until more studies are done.
+
+
